@@ -5,6 +5,7 @@
   "windows": [
     "main",
     "epub-editor-*",
+    "epub-metadata",
     "search-replace"
   ],
   "permissions": [

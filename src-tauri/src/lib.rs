@@ -550,6 +550,13 @@ struct HistoryMeta {
     date_str: String,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+struct AssetInfo {
+    name: String,
+    path: String,
+    category: String, // "fonts", "images", "others"
+}
+
 #[derive(Deserialize, Debug)]
 struct EpubMetadata {
     title: String,
@@ -560,6 +567,14 @@ struct EpubMetadata {
     md5: String,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    main_css: String,
+    #[serde(default)]
+    font_css: String,
+    #[serde(default)]
+    assets: Vec<AssetInfo>,
+    #[serde(flatten)]
+    extra: HashMap<String, String>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -942,11 +957,22 @@ async fn export_epub(
 
     zip.start_file("OEBPS/Styles/font.css", options)
         .map_err(|e| e.to_string())?;
-    zip.write_all(CSS_FONT.as_bytes())
+    let font_css = if metadata.font_css.trim().is_empty() {
+        CSS_FONT
+    } else {
+        &metadata.font_css
+    };
+    zip.write_all(font_css.as_bytes())
         .map_err(|e| e.to_string())?;
+
     zip.start_file("OEBPS/Styles/main.css", options)
         .map_err(|e| e.to_string())?;
-    zip.write_all(CSS_MAIN.as_bytes())
+    let main_css = if metadata.main_css.trim().is_empty() {
+        CSS_MAIN
+    } else {
+        &metadata.main_css
+    };
+    zip.write_all(main_css.as_bytes())
         .map_err(|e| e.to_string())?;
 
     let mut has_cover = false;
@@ -980,6 +1006,40 @@ async fn export_epub(
             "image/jpeg"
         };
         manifest_items.push_str(&format!(r#"<item id="cover-image" href="Images/cover.{}" media-type="{}" properties="cover-image"/>"#, cover_ext, mime));
+    }
+
+    // 写入资产文件
+    for (i, asset) in metadata.assets.iter().enumerate() {
+        if let Ok(asset_bytes) = fs::read(&asset.path) {
+            let sub_dir = match asset.category.as_str() {
+                "fonts" => "Fonts",
+                "images" => "Images",
+                _ => "Other",
+            };
+            let asset_filename = format!("OEBPS/{}/{}", sub_dir, asset.name);
+            zip.start_file(&asset_filename, options)
+                .map_err(|e| e.to_string())?;
+            zip.write_all(&asset_bytes).map_err(|e| e.to_string())?;
+
+            let href = format!("{}/{}", sub_dir, asset.name);
+            let mime = match Path::new(&asset.name).extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase().as_str() {
+                "ttf" => "font/ttf",
+                "otf" => "font/otf",
+                "woff" => "font/woff",
+                "woff2" => "font/woff2",
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "svg" => "image/svg+xml",
+                "css" => "text/css",
+                "js" => "text/javascript",
+                _ => "application/octet-stream",
+            };
+            manifest_items.push_str(&format!(
+                r#"<item id="asset_{}" href="{}" media-type="{}"/>"#,
+                i, href, mime
+            ));
+        }
     }
     manifest_items
         .push_str(r#"<item id="font.css" href="Styles/font.css" media-type="text/css"/>"#);
@@ -1136,6 +1196,16 @@ async fn export_epub(
         format!("urn:uuid:{}", metadata.uuid)
     };
 
+    let mut extra_metadata = String::new();
+    for (k, v) in &metadata.extra {
+        extra_metadata.push_str(&format!(
+            "    <dc:{} pub-type=\"zdy\">{}</dc:{}>\n",
+            escape_xml(k),
+            escape_xml(v),
+            escape_xml(k)
+        ));
+    }
+
     let opf_content = format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId" version="2.0">
@@ -1148,7 +1218,7 @@ async fn export_epub(
     <dc:description>{}</dc:description>
     <meta name="cover" content="cover-image" />
     <meta property="reamicro:md5" content="{}" />
-  </metadata>
+{}  </metadata>
   <manifest>
     <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
     {}
@@ -1164,6 +1234,7 @@ async fn export_epub(
         full_uuid,
         escape_xml(&metadata.description),
         metadata.md5,
+        extra_metadata,
         manifest_items,
         spine_refs
     );

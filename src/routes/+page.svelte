@@ -1,6 +1,7 @@
 <script lang="ts">
     import { onMount, tick } from "svelte";
     import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+    import { listen, emit } from "@tauri-apps/api/event";
     import { open, save, message, ask } from "@tauri-apps/plugin-dialog";
     // import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs"; // Removed to force use of custom backend
     import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -65,6 +66,7 @@
         metaRegex: "^\\s*(内容)?(简介|序[章言]?|前言|楔子|后记|完本感言).*", // 之前丢失的
         wordCountThreshold: 8000,
         clearHistoryOnSave: false,
+        defaultEpubStyles: { "main.css": "", "font.css": "" },
     };
 
     // --- [3. 核心状态] ---
@@ -108,6 +110,8 @@
         md5: "",
         cover_path: "",
         description: "",
+        styles: { "main.css": "", "font.css": "" },
+        assets: [] as { name: string, path: string, category: string }[],
     };
     let showAdvancedEpub = false;
     let customMetadata: { key: string; value: string }[] = [];
@@ -199,34 +203,28 @@
         window.removeEventListener("mouseup", stopDrag);
     }
 
-    onMount(async () => {
-        // [Window Position Logic]
-        if (typeof window !== "undefined") {
-            const { getCurrentWindow, LogicalPosition } = await import(
-                "@tauri-apps/api/window"
-            );
+    onMount(() => {
+        let unlistenClose: any;
+
+        const init = async () => {
+            const { getCurrentWindow, LogicalPosition } = await import("@tauri-apps/api/window");
             const appWindow = getCurrentWindow();
             const label = appWindow.label;
 
-            // Restore Position
+            // 1. 窗口位置恢复
             const savedPos = localStorage.getItem("window_pos_" + label);
             if (savedPos) {
                 try {
                     const { x, y } = JSON.parse(savedPos);
                     await appWindow.setPosition(new LogicalPosition(x, y));
-                } catch (e) {
-                    console.error("Restore pos error", e);
-                }
+                } catch (e) {}
             }
 
-            // Save Position on Move
+            // 监听移动并保存
             appWindow.listen("tauri://move", async () => {
                 try {
                     const pos = await appWindow.outerPosition();
-                    localStorage.setItem(
-                        "window_pos_" + label,
-                        JSON.stringify(pos),
-                    );
+                    localStorage.setItem("window_pos_" + label, JSON.stringify(pos));
                 } catch (e) {}
             });
 
@@ -236,25 +234,18 @@
                 await appWindow.show();
                 await appWindow.setFocus();
             });
-        }
 
-        let unlisten: any;
-
-        const init = async () => {
-            // 1. 移动端检测
+            // 2. 移动端检测
             if (window.innerWidth < 768) {
                 isMobile = true;
                 showSidebar = false;
             }
 
-            // 2. 读取设置
+            // 3. 读取设置
             const stored = localStorage.getItem("app-settings");
-            if (stored)
+            if (stored) {
                 try {
-                    appSettings = {
-                        ...DEFAULT_SETTINGS,
-                        ...JSON.parse(stored),
-                    };
+                    appSettings = { ...DEFAULT_SETTINGS, ...JSON.parse(stored) };
                     // 迁移旧版正则：将 [章回] 替换为排除"回合"的模式
                     if (appSettings.chapRegex.includes("[章回]")) {
                         appSettings.chapRegex = appSettings.chapRegex.replace(
@@ -267,44 +258,28 @@
                         );
                     }
                 } catch (e) {}
+            }
 
-            // 3. 崩溃恢复逻辑 (完整保留)
-            // 3. 崩溃恢复逻辑
+            // 4. 崩溃恢复逻辑
             const savedState = localStorage.getItem("app-crash-recovery");
             if (savedState) {
                 try {
                     const state = JSON.parse(savedState);
-                    if (
-                        state.filePath &&
-                        state.filePath !== "请打开一本小说..."
-                    ) {
+                    if (state.filePath && state.filePath !== "请打开一本小说...") {
                         filePath = state.filePath;
-
-                        // Check if file exists first
                         let diskContent = "";
                         try {
-                            diskContent = await invoke("read_text_file", {
-                                path: filePath,
-                            });
+                            diskContent = await invoke("read_text_file", { path: filePath });
                         } catch (e) {
                             console.warn("File read fail:", e);
                         }
 
-                        // Logic: If state says modified, restore content.
-                        // BUT if we just saved and exited, state.isModified should be false.
-                        if (
-                            state.isModified &&
-                            state.content &&
-                            state.content !== diskContent
-                        ) {
+                        if (state.isModified && state.content && state.content !== diskContent) {
                             fileContent = state.content;
                             isModified = true;
                         } else {
-                            // Either not modified, or content matches disk (false alarm)
                             fileContent = diskContent;
-                            // Ensure modification flag is false
                             isModified = false;
-                            // Clear cache if it was a false alarm
                             if (state.isModified)
                                 localStorage.removeItem("app-crash-recovery");
                         }
@@ -316,13 +291,7 @@
                             epubMeta = extractMetadata(fileContent, filePath);
                             updateMd5(fileContent);
                             if (state.scrollLine) {
-                                setTimeout(
-                                    () =>
-                                        editorComponent?.scrollToLine(
-                                            state.scrollLine,
-                                        ),
-                                    200,
-                                );
+                                setTimeout(() => editorComponent?.scrollToLine(state.scrollLine), 200);
                             }
                         }
                     }
@@ -331,37 +300,24 @@
                     localStorage.removeItem("app-crash-recovery");
                 }
             }
+
+            // 5. 文件关联启动
             setTimeout(async () => {
-                // Check launch args first (File Association)
-                const launchArg = await invoke<string | null>(
-                    "get_launch_args",
-                );
-                if (launchArg) {
-                    openLocalFile(launchArg, true); // true = initial launch
-                }
+                const launchArg = await invoke<string | null>("get_launch_args");
+                if (launchArg) openLocalFile(launchArg, true);
                 hasInitialized = true;
             }, 500);
 
-            // 4. Windows Title & Close Handler
-            const setupCloseHandler = async () => {
-                try {
-                    const appWindow = getCurrentWindow();
-                    await appWindow.setTitle("TEpub-Editor-TXT");
-                    unlisten = await appWindow.onCloseRequested(
-                        async (event) => {
-                            if (isModified) {
-                                event.preventDefault();
-                                showCloseDialog = true;
-                            } else {
-                                await invoke("exit_app");
-                            }
-                        },
-                    );
-                } catch (e) {
-                    console.error("Setup close handler failed", e);
+            // 6. 关闭拦截
+            await appWindow.setTitle("TEpub-Editor-TXT");
+            unlistenClose = await appWindow.onCloseRequested(async (event) => {
+                if (isModified) {
+                    event.preventDefault();
+                    showCloseDialog = true;
+                } else {
+                    await invoke("exit_app");
                 }
-            };
-            setupCloseHandler();
+            });
         };
 
         init();
@@ -373,7 +329,7 @@
         window.addEventListener("editor-select-all", handleSelectAll);
 
         return () => {
-            if (unlisten) unlisten();
+            if (unlistenClose) unlistenClose();
             window.removeEventListener("editor-select-all", handleSelectAll);
         };
     });
@@ -396,6 +352,7 @@
             md5: epubMeta.md5 || "",
             cover_path: epubMeta.cover_path || "",
             description: "",
+            styles: { ...epubMeta.styles },
         };
 
         // 默认书名
@@ -403,20 +360,42 @@
         meta.title = basename;
 
         try {
-            // 1. 书名 (更稳健的正则)
-            const titleMatch = content.match(/(?:^|\n)\s*(?:书名|小说名|Title)[\s:：]*([^\n\r]+)/i);
-            if (titleMatch && titleMatch[1]) meta.title = titleMatch[1].trim();
+            const lines = content.split("\n").map(l => l.trim()).filter(l => l.length > 0);
+            if (lines.length > 0) {
+                const firstLine = lines[0];
+                const secondLine = lines.length > 1 ? lines[1] : "";
 
-            // 2. 作者
-            const authorMatch = content.match(/(?:^|\n)\s*(?:作者|Author)[\s:：]*([^\n\r]+)/i);
-            if (authorMatch && authorMatch[1]) meta.creator = authorMatch[1].trim();
+                // 规则 1: 书名号提取 《...》
+                const bracketMatch = firstLine.match(/《([^》]+)》/);
+                if (bracketMatch) {
+                    meta.title = bracketMatch[1].trim();
+                }
+                // 规则 2: "书名：" 前缀
+                else if (firstLine.match(/^(?:书名|小说名|Title)[\s:：]+(.*)/i)) {
+                    meta.title = firstLine.replace(/^(?:书名|小说名|Title)[\s:：]+/i, "").trim();
+                }
+                // 规则 3: 双行关联 (如果第二行是作者，第一行通常是书名)
+                else if (secondLine.match(/^(?:作者|Author|By)[\s:：~]*(.*)/i)) {
+                    meta.title = firstLine.trim();
+                }
+            }
 
-            // 3. 简介 (更稳健的正则，支持无冒号换行)
-            // 优化：允许简介文字跨多行，直到看到章节标志
-            const descMatch = content.match(/(?:^|\n)\s*(?:内容)?(?:简介|Intro|Description)[\s:：]*([\s\S]+?)(?=\n\s*(?:第[零一二三四五六七八九十百千万0-9]+[卷部章回|卷部]|Chapter\s*\d+)|$)/i);
+            // 提取作者 (严格限制在前 2 行)
+            const first2LinesForAuthor = lines.slice(0, 2).join("\n");
+            const authorMatch = first2LinesForAuthor.match(/(?:^|\n)\s*(?:作者|Author|By)[\s:：~]*([^\n\r]+)/i);
+            if (authorMatch && authorMatch[1]) {
+                meta.creator = authorMatch[1].trim();
+            }
+
+            // 规则 4: 书名兜底（前两行未识别出《》或书名：时）
+            if (!meta.title || meta.title === "书名" || meta.title === meta.creator) {
+                 meta.title = basename;
+            }
+
+            // 3. 简介 (更精准的正则：保留首行缩进)
+            const descMatch = content.match(/(?:^|\n)[^\S\n]*(?:内容)?(?:简介|Intro|Description)[\t ]*[:：]?[\t ]*(?:\r?\n)?([\s\S]+?)(?=\n\s*(?:第[零一二三四五六七八九十百千万0-9]+[卷部章回|卷部]|Chapter\s*\d+)|$)/i);
             if (descMatch && descMatch[1]) {
-                const desc = descMatch[1].trim();
-                // 如果匹配到的内容太多（比如没找到章节标志一直匹配到结尾），且文档本身很长，则进行截断保护
+                const desc = descMatch[1].replace(/\s+$/, ""); // 仅修剪尾部空白
                 if (desc.length > 0) {
                     meta.description = desc.length > 3000 ? desc.substring(0, 3000) + "..." : desc;
                 }
@@ -425,6 +404,91 @@
             console.log("Metadata extract failed", e);
         }
         return meta;
+    }
+
+    function refreshEpubMetadata() {
+        if (!fileContent) return;
+        const fresh = extractMetadata(fileContent, filePath);
+        
+        // 如果文件内容已修改，或者当前仍是默认占位符，则更新主要字段
+        const isTitleDefault = epubMeta.title === "书名" || !epubMeta.title;
+        const isCreatorDefault = epubMeta.creator === "作者" || !epubMeta.creator;
+
+        if (isModified || isTitleDefault) epubMeta.title = fresh.title;
+        if (isModified || isCreatorDefault) epubMeta.creator = fresh.creator;
+        if (isModified || !epubMeta.description) epubMeta.description = fresh.description;
+        
+        // 加载自定义内置样式 (如果存在)
+        if (appSettings.defaultEpubStyles) {
+            if (!epubMeta.styles["main.css"]) epubMeta.styles["main.css"] = appSettings.defaultEpubStyles["main.css"];
+            if (!epubMeta.styles["font.css"]) epubMeta.styles["font.css"] = appSettings.defaultEpubStyles["font.css"];
+        }
+
+        // UUID 保持不变除非为空
+        if (!epubMeta.uuid) epubMeta.uuid = fresh.uuid;
+        // 强制重新计算 MD5
+        updateMd5(fileContent);
+    }
+
+    async function openAdvancedEpubMetadata() {
+        try {
+            const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+            
+            // 检查窗口是否已存在
+            const existing = await WebviewWindow.getByLabel("epub-metadata");
+            if (existing) {
+                await existing.setFocus();
+                return;
+            }
+
+            const win = new WebviewWindow("epub-metadata", {
+                url: "/epub-metadata",
+                title: "高级选项",
+                width: 450,
+                height: 480,
+                resizable: true,
+                decorations: true,
+                center: true,
+            });
+
+            // 监听初始化请求
+            win.once("metadata-window-ready", async () => {
+                await emit("init-metadata", {
+                    meta: {
+                        publisher: epubMeta.publisher,
+                        uuid: epubMeta.uuid,
+                        md5: epubMeta.md5,
+                        styles: { ...epubMeta.styles }
+                    },
+                    custom: customMetadata
+                });
+            });
+
+            // 监听更新
+            const unlisten = await listen("update-metadata", (event: any) => {
+                const { meta, custom, persistCss } = event.payload;
+                epubMeta.publisher = meta.publisher;
+                epubMeta.uuid = meta.uuid;
+                epubMeta.md5 = meta.md5;
+                epubMeta.styles = { ...meta.styles };
+                customMetadata = [...custom];
+
+                if (persistCss) {
+                    appSettings.defaultEpubStyles = { ...meta.styles };
+                    localStorage.setItem("app-settings", JSON.stringify(appSettings));
+                    console.log("Persisted custom styles to settings");
+                }
+
+                console.log("Updated metadata from window:", event.payload);
+            });
+
+            win.once("tauri://destroyed", () => {
+                unlisten();
+            });
+
+        } catch (e) {
+            message("打开高级设置失败: " + e, { kind: "error" });
+        }
     }
 
     function saveStateToCache(line: number) {
@@ -549,7 +613,7 @@
                         if (line.length > 800) {
                             // 遇到八百字不换行的“伪文字段落”，在句号/叹号/问号后（包裹着引号时也行），并且后面跟着空格或什么都没有的地方，强制斩断加回车
                             return line.replace(
-                                /([。！？\.\!\?][”’」』]*)(?=\s|\S)/g,
+                                /([。\.\!\?][”’」』]*)(?=\s|\S)/g,
                                 "$1\n",
                             );
                         }
@@ -1113,19 +1177,17 @@
                 return c;
             });
 
-            // 整合自定义元数据
-            const finalMetadata = { ...epubMeta };
-            customMetadata.forEach(item => {
-                if (item.key.trim()) {
-                    (finalMetadata as any)[item.key.trim()] = item.value;
-                }
-            });
-
             await invoke("export_epub", {
                 savePath,
                 content: fileContent,
                 chapters,
-                metadata: finalMetadata,
+                metadata: {
+                    description: epubMeta.description,
+                    main_css: epubMeta.styles["main.css"],
+                    font_css: epubMeta.styles["font.css"],
+                    assets: epubMeta.assets,
+                    ...Object.fromEntries(customMetadata.map(m => [m.key, m.value]))
+                },
             });
             // 制作成功：设置状态为成功，在UI上显示操作按钮
             epubGenerationStatus = "success";
@@ -1134,7 +1196,6 @@
             // (We can assume 'savePath' is available, but we need to store it in a state variable
             // if we want the button in HTML to access it easily?
             // actually 'savePath' is local. Let's create a module-level variable or just use the closure if we were inline.
-            // But here we are modifying state for the template.
             // Let's add a state variable `lastGeneratedEpubPath`.
             lastGeneratedEpubPath = savePath;
         } catch (e) {
@@ -1215,20 +1276,8 @@
                 class="btn-secondary"
                 on:click={() => {
                     closeAllPanels();
+                    refreshEpubMetadata();
                     showEpubModal = true;
-                    updateMd5(fileContent);
-                    // 确保书名已填充
-                    if (
-                        epubMeta.title === "书名" &&
-                        filePath !== "请打开一本小说..."
-                    ) {
-                        const basename =
-                            filePath
-                                .split(/[\\/]/)
-                                .pop()
-                                ?.replace(/\.[^/.]+$/, "") || "未命名";
-                        epubMeta.title = basename;
-                    }
                     // 重置EPUB制作状态
                     epubGenerationStatus = "idle";
                 }}>📚</button
@@ -1496,13 +1545,13 @@
                                     <label for="ec">作者:</label>
                                     <input id="ec" type="text" bind:value={epubMeta.creator} class="epub-input-small" />
                                 </div>
-                                <div class="set-row compact" style="align-items: flex-start;">
-                                    <label for="ed" style="margin-top: 6px;">简介:</label>
+                                <div class="set-row compact align-start">
+                                    <label for="ed">简介:</label>
                                     <textarea
                                         id="ed"
                                         rows="6"
                                         bind:value={epubMeta.description}
-                                        class="epub-textarea-no-indent"
+                                        class="epub-textarea"
                                         placeholder="请输入书籍简介..."
                                     ></textarea>
                                 </div>
@@ -1510,8 +1559,8 @@
 
                             <!-- 右侧：封面预览 -->
                             <div class="epub-cover-column">
-                                <div 
-                                    class="epub-cover-preview" 
+                                <div
+                                    class="epub-cover-preview"
                                     on:click={async () => {
                                         const s = await open({
                                             filters: [{ name: "Image", extensions: ["jpg", "png", "jpeg", "webp"] }],
@@ -1535,61 +1584,19 @@
                             </div>
                         </div>
 
-                        <!-- 高级选项折叠区 -->
-                        {#if showAdvancedEpub}
-                            <div class="epub-advanced-area">
-                                <div class="set-row compact">
-                                    <label for="ep">出版社:</label>
-                                    <input id="ep" type="text" bind:value={epubMeta.publisher} placeholder="(可选)" class="epub-input-small" />
-                                </div>
-                                <div class="set-row compact">
-                                    <label>UUID:</label>
-                                    <input type="text" value={epubMeta.uuid} readonly class="epub-input-readonly" />
-                                </div>
-                                <div class="set-row compact">
-                                    <label>MD5:</label>
-                                    <input type="text" value={epubMeta.md5} readonly class="epub-input-readonly" />
-                                </div>
-
-                                <!-- 自定义项 -->
-                                <div class="epub-custom-meta-section">
-                                    <div class="section-header">
-                                        <span>自定义元数据</span>
-                                        <button class="mini-icon-btn" on:click={() => customMetadata = [...customMetadata, { key: '', value: '' }]}>➕</button>
-                                    </div>
-                                    {#each customMetadata as item, i}
-                                        <div class="custom-meta-row">
-                                            <input type="text" bind:value={item.key} placeholder="键" />
-                                            <input type="text" bind:value={item.value} placeholder="值" />
-                                            <button class="mini-icon-btn remove" on:click={() => {
-                                                customMetadata.splice(i, 1);
-                                                customMetadata = [...customMetadata];
-                                            }}>✕</button>
-                                        </div>
-                                    {/each}
-                                </div>
-                            </div>
-                        {/if}
-
-                        <div class="epub-footer-actions">
-                            {#if epubGenerationStatus === "idle"}
-                                <button class="grid-btn" on:click={() => showAdvancedEpub = !showAdvancedEpub}>
-                                    {showAdvancedEpub ? '隐藏高级选项' : '高级选项'}
-                                </button>
-                                <button class="grid-btn blue" on:click={generateEpub}>开始生成</button>
-                            {:else if epubGenerationStatus === "generating"}
-                                <button class="grid-btn full-row" disabled style="opacity:0.6; cursor:not-allowed;">正在制作...</button>
-                            {:else if epubGenerationStatus === "success"}
-                                <div style="display:flex; gap:10px; width: 100%;">
-                                    <button class="grid-btn blue" style="flex:1;" on:click={() => {
-                                        if (lastGeneratedEpubPath) {
-                                            openLocalFile(lastGeneratedEpubPath);
-                                            closeAllPanels();
-                                        }
-                                    }}>打开预览</button>
-                                    <button class="grid-btn" style="flex:1;" on:click={closeAllPanels}>完成关闭</button>
-                                </div>
-                            {/if}
+                        <div class="epub-modal-footer">
+                            <button class="epub-cancel" on:click={openAdvancedEpubMetadata}>
+                                高级选项
+                            </button>
+                            <button
+                                class="epub-confirm"
+                                disabled={epubGenerationStatus === "generating"}
+                                on:click={generateEpub}
+                            >
+                                {epubGenerationStatus === "generating"
+                                    ? "制作中..."
+                                    : "开始制作"}
+                            </button>
                         </div>
                     </div>
                 {:else if showHistoryPanel}
@@ -1686,10 +1693,15 @@
         <div
             class="check-panel"
             style="left: {checkPanelPos.x}px; top: {checkPanelPos.y}px;"
-            on:mousedown={(e) => startDrag(e, "check")}
         >
-            <div class="find-header">
-                <span class="drag-title">内容检查 (可拖拽)</span>
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div
+                class="find-header"
+                on:mousedown={(e) => startDrag(e, "check")}
+                role="application"
+                aria-label="拖拽以移动内容检查面板"
+            >
+                <span class="find-title">全书检查</span>
                 <button
                     class="icon-close"
                     on:click={() => (showCheckPanel = false)}>✕</button
@@ -1699,28 +1711,27 @@
                 class="find-body scroll-p"
                 style="max-height: 400px; overflow-y: auto;"
             >
-                <!-- 断序 -->
+                <!-- 章节跳转连贯性 -->
                 <div class="check-sec">
                     <div
                         class="sec-title"
-                        on:click={() =>
-                            (checkCollapseState.seq = !checkCollapseState.seq)}
+                        role="button"
+                        tabindex="0"
+                        on:click={() => (checkCollapseState.seq = !checkCollapseState.seq)}
+                        on:keydown={(e) => e.key === 'Enter' && (checkCollapseState.seq = !checkCollapseState.seq)}
                     >
-                        <span
-                            >{checkCollapseState.seq ? "▶" : "▼"} 断序章节 ({sequenceErrors.length})</span
-                        >
+                        <span>{checkCollapseState.seq ? "▶" : "▼"} 章节序号不连贯 ({sequenceErrors.length})</span>
                     </div>
                     {#if !checkCollapseState.seq}
                         <div class="tag-list">
                             {#each sequenceErrors as e}
                                 <button
-                                    class="err-tag err-tag-seq"
-                                    on:click={() =>
-                                        handleChapterClick(e.id, e.line)}
-                                    ><span class="err-tag-title">{e.title}</span
-                                    ><span class="err-tag-msg">({e.msg})</span
-                                    ></button
+                                    class="err-tag"
+                                    on:click={() => handleChapterClick(e.id, e.line)}
                                 >
+                                    <span class="err-tag-title">{e.title}</span>
+                                    <span class="err-tag-msg">({e.msg})</span>
+                                </button>
                             {:else}<span class="toc-count">无</span>{/each}
                         </div>
                     {/if}
@@ -1730,23 +1741,20 @@
                 <div class="check-sec">
                     <div
                         class="sec-title"
-                        on:click={() =>
-                            (checkCollapseState.title =
-                                !checkCollapseState.title)}
+                        role="button"
+                        tabindex="0"
+                        on:click={() => (checkCollapseState.title = !checkCollapseState.title)}
+                        on:keydown={(e) => e.key === 'Enter' && (checkCollapseState.title = !checkCollapseState.title)}
                     >
-                        <span
-                            >{checkCollapseState.title ? "▶" : "▼"} 标题空内容 ({titleErrors.length})</span
-                        >
+                        <span>{checkCollapseState.title ? "▶" : "▼"} 标题空内容 ({titleErrors.length})</span>
                     </div>
                     {#if !checkCollapseState.title}
                         <div class="tag-list">
                             {#each titleErrors as e}
                                 <button
                                     class="err-tag"
-                                    on:click={() =>
-                                        handleChapterClick(e.id, e.line)}
-                                    >{e.title}</button
-                                >
+                                    on:click={() => handleChapterClick(e.id, e.line)}
+                                >{e.title}</button>
                             {:else}<span class="toc-count">无</span>{/each}
                         </div>
                     {/if}
@@ -1756,22 +1764,20 @@
                 <div class="check-sec">
                     <div
                         class="sec-title"
-                        on:click={() =>
-                            (checkCollapseState.word =
-                                !checkCollapseState.word)}
+                        role="button"
+                        tabindex="0"
+                        on:click={() => (checkCollapseState.word = !checkCollapseState.word)}
+                        on:keydown={(e) => e.key === 'Enter' && (checkCollapseState.word = !checkCollapseState.word)}
                     >
-                        <span
-                            >{checkCollapseState.word ? "▶" : "▼"} 字数超标 ({wordCountErrors.length})</span
-                        >
+                        <span>{checkCollapseState.word ? "▶" : "▼"} 字数超标 ({wordCountErrors.length})</span>
                     </div>
                     {#if !checkCollapseState.word}
                         <div class="tag-list">
                             {#each wordCountErrors as e}
                                 <button
                                     class="err-tag"
-                                    on:click={() =>
-                                        handleChapterClick(e.id, e.line)}
-                                    >{e.title} ({e.val})</button
+                                    on:click={() => handleChapterClick(e.id, e.line)}
+                                >{e.title} ({e.val})</button
                                 >
                             {:else}<span class="toc-count">无</span>{/each}
                         </div>
@@ -1887,6 +1893,9 @@
         overflow: hidden;
         -webkit-touch-callout: none;
         -webkit-user-select: none;
+        -moz-user-select: none;
+        user-select: none;
+
         font-family: system-ui;
     }
     .app-container {
@@ -2074,216 +2083,57 @@
         z-index: 50;
     }
 
-    /* 查找面板 - 紧凑型设计 */
-    .find-panel {
-        position: fixed;
-        background: #fff;
-        border: 1px solid #ccc;
-        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
-        border-radius: 8px;
-        width: 300px;
-        z-index: 1000;
-        display: flex;
-        flex-direction: column;
-        overflow: hidden;
-        font-size: 13px;
-    }
-    .find-header {
-        background: #f5f5f5;
-        padding: 8px 12px;
-        cursor: move;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        border-bottom: 1px solid #ddd;
-        user-select: none;
-    }
-
-    .check-panel {
-        position: fixed;
-        background: #fff;
-        border: 1px solid #ccc;
-        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
-        border-radius: 8px;
-        width: 320px;
-        z-index: 1100; /* Higher than find panel */
-        display: flex;
-        flex-direction: column;
-        font-size: 13px;
-        max-height: 80vh;
-        overflow: hidden;
-    }
-    .check-sec {
-        margin-bottom: 10px;
-        border-bottom: 1px dashed #eee;
-        padding-bottom: 5px;
-    }
-    .sec-title {
-        font-weight: bold;
-        margin-bottom: 5px;
-        cursor: pointer;
-        user-select: none;
-        background: #fafafa;
-        padding: 4px;
-        border-radius: 4px;
-    }
-    .sec-title:hover {
-        background: #f0f0f0;
-    }
-    .tag-list {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 5px;
-    }
-    .err-tag {
-        border: none;
-        background: #fff3e0;
-        color: #e65100;
-        font-size: 11px;
-        padding: 2px 6px;
-        border-radius: 4px;
-        cursor: pointer;
-        max-width: 100%;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-    }
-    .err-tag-seq {
-        display: inline-flex;
-        align-items: center;
-        gap: 2px;
-        white-space: nowrap;
-    }
-    .err-tag-title {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        min-width: 0;
-    }
-    .err-tag-msg {
-        flex-shrink: 0;
-        color: #c62828;
-        font-weight: bold;
-    }
-    .err-tag:hover {
-        background: #ffe0b2;
-    }
-    .drag-title {
-        font-weight: bold;
-        color: #555;
-        font-size: 12px;
-    }
-    .icon-close {
-        background: none;
-        border: none;
-        font-size: 16px;
-        width: 20px;
-        min-width: unset; /* Override global button min-width */
-        height: 20px;
-        padding: 0;
-        line-height: 1;
-        color: #888;
-        cursor: pointer;
-    }
-    .icon-close:hover {
-        color: #d32f2f;
-    }
-
-    .find-body {
-        padding: 12px;
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-    }
-    .find-grid {
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-    }
-    .input-group {
-        display: flex;
-        align-items: center;
-        border: 1px solid #ddd;
-        border-radius: 4px;
-        overflow: hidden;
-        height: 28px;
-    }
-    .input-group input[type="text"] {
+    .epub-textarea {
         flex: 1;
-        border: none;
-        padding: 4px 8px;
-        outline: none;
-        font-size: 13px;
-        height: 100%;
-    }
-    .regex-tag {
-        background: #eee;
-        padding: 0 6px;
-        border-left: 1px solid #ddd;
-        display: flex;
-        align-items: center;
-        gap: 4px;
-        font-size: 11px;
-        height: 100%;
-        color: #666;
-        cursor: pointer;
-    }
-
-    .msg-bar-compact {
-        height: 16px;
-        font-size: 11px;
-        color: #e65100;
-        text-align: right;
-    }
-
-    .action-bar {
-        display: flex;
-        justify-content: space-between;
-        gap: 8px;
-    }
-    .nav-btns {
-        display: flex;
-        gap: 4px;
-    }
-    .nav-btns button {
-        width: 28px;
-        height: 28px;
-        padding: 0;
+        padding: 8px;
+        background: #fdfdfd;
         border: 1px solid #ddd;
         border-radius: 4px;
-        background: #fff;
-        cursor: pointer;
-    }
-    .nav-btns button:hover {
-        background: #f0f0f0;
+        resize: vertical;
+        font-family: inherit;
+        font-size: 13px;
+        line-height: 1.6;
+        /* text-indent: 2em; 移除强制缩进，使用原文缩进 */
     }
 
-    .op-btns {
+    .p-header {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 10px 15px;
+        background: #f8fafc;
+        border-bottom: 1px solid #eceff1;
         display: flex;
-        gap: 6px;
+        justify-content: space-between;
+        align-items: center;
+        user-select: none;
     }
-    .btn-small {
-        padding: 0 10px;
-        height: 28px;
-        font-size: 12px;
-        border-radius: 4px;
-        border: 1px solid #ccc;
+    .p-body {
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+    }
+    .set-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 15px;
+        gap: 10px;
+    }
+    .set-row label {
+        width: 110px;
+        flex-shrink: 0;
+        font-weight: bold;
+        color: #444;
+    }
+    .set-row input {
+        flex: 1;
+        padding: 8px;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        font-size: 15px;
         background: #fff;
-        cursor: pointer;
     }
-    .btn-small:hover {
-        background: #f5f5f5;
-        border-color: #bbb;
-    }
-    .btn-dang {
-        color: #d32f2f;
-        border-color: #ffcdd2;
-        background: #ffebee;
-    }
-    .btn-dang:hover {
-        background: #ffcdd2;
-    }
-
-    /* 弹窗样式 - 绝对居中 */
     .modal-overlay {
         position: fixed;
         inset: 0;
@@ -2305,129 +2155,10 @@
         flex-direction: column;
         box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
     }
-    .p-header {
-        width: 100%;
-        box-sizing: border-box;
-        padding: 12px 18px;
-        background: #f0f0f0;
-        font-weight: bold;
-        border-bottom: 1px solid #ddd;
-        font-size: 16px;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        flex-shrink: 0;
-    }
-    .p-body {
-        padding: 20px;
-        display: flex;
-        flex-direction: column;
-        gap: 16px;
-    }
-    .scroll-p {
-        max-height: 60vh;
-        overflow-y: auto;
-    }
-    .set-row {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        font-size: 15px;
-        gap: 10px;
-    }
-    .set-row label {
-        width: 110px;
-        flex-shrink: 0;
-        font-weight: bold;
-        color: #444;
-    }
-    .set-row input,
-    .set-row button.mini-btn {
-        width: auto !important;
-        flex: 1;
-        padding: 8px !important;
-        border: 1px solid #ddd !important;
-        border-radius: 6px !important;
-        font-size: 15px !important;
-        background: #fff !important;
-        height: auto !important;
-        line-height: 1.5 !important;
-        box-sizing: border-box !important;
-        display: block !important;
-        min-height: 38px !important;
-    }
 
-    .err-tag {
-        margin: 3px;
-        padding: 6px 14px;
-        background: #fee;
-        color: #c00;
-        border: 1px solid #fcc;
-        border-radius: 20px;
-        font-size: 13px;
-    }
-    .hist-item {
-        display: flex;
-        justify-content: space-between;
-        padding: 16px;
-        border-bottom: 1px solid #eee;
-        width: 100%;
-        background: #fff;
-    }
-    .sec-title {
-        font-weight: bold;
-        font-size: 14px;
-        border-left: 5px solid #0066b8;
-        padding-left: 10px;
-        margin-bottom: 10px;
-    }
-    .empty-msg {
-        text-align: center;
-        color: #999;
-        padding: 20px;
-    }
-
-    /* EPUB制作完成按钮样式 - 墨蓝色渐变 */
-    .epub-success {
-        background: linear-gradient(
-            135deg,
-            #1e3a8a 0%,
-            #3b82f6 100%
-        ) !important;
-        color: white !important;
-        border: none !important;
-        font-weight: 600;
-        box-shadow: 0 4px 12px rgba(30, 58, 138, 0.3);
-    }
-    .epub-success:active {
-        background: linear-gradient(
-            135deg,
-            #1e40af 0%,
-            #2563eb 100%
-        ) !important;
-        transform: scale(0.98);
-    }
-
-    .sidebar-mask {
-        position: absolute;
-        inset: 0;
-        background: rgba(0, 0, 0, 0.4);
-        z-index: 90;
-    }
-    @media (max-width: 768px) {
-        .sidebar {
-            position: absolute;
-            z-index: 1000;
-            left: 0;
-            top: 0;
-            bottom: 0;
-            width: 85%;
-            box-shadow: 15px 0 50px rgba(0, 0, 0, 0.3);
-        }
-    }
     /* EPUB 制作面板重构样式 */
     .epub-modal-body {
-        max-width: 680px !important; /* 增加宽度以容纳分栏 */
+        max-width: 680px !important;
         font-size: 13px;
         color: #444;
     }
@@ -2450,17 +2181,24 @@
         flex-shrink: 0;
     }
 
-    /* 紧凑型行布局 */
     .set-row.compact {
         margin-bottom: 0;
         gap: 12px;
+        align-items: center;
+    }
+    .set-row.align-start {
+        align-items: flex-start !important;
+    }
+    .set-row.align-start label {
+        margin-top: 10px !important;
     }
 
     .set-row.compact label {
-        width: 50px; /* 进一步缩小 Label 宽度 */
+        width: 50px;
         font-weight: 500;
         color: #666;
         font-size: 13px;
+        margin: 0;
     }
 
     .epub-input-small {
@@ -2472,20 +2210,6 @@
         width: 100%;
     }
 
-    .epub-textarea-no-indent {
-        flex: 1;
-        padding: 10px;
-        border: 1px solid #ddd;
-        border-radius: 4px;
-        font-size: 13px;
-        font-family: inherit;
-        line-height: 1.6;
-        resize: vertical;
-        min-height: 120px;
-        text-indent: 0 !important; /* 禁用首行缩进 */
-    }
-
-    /* 封面预览窗 */
     .epub-cover-preview {
         width: 100%;
         height: 220px;
@@ -2542,98 +2266,13 @@
         opacity: 1;
     }
 
-    /* 高级选项区 */
-    .epub-advanced-area {
-        background: #f8f8f8;
-        border-radius: 8px;
-        padding: 16px;
-        margin-top: 10px;
-        margin-bottom: 20px;
-        border: 1px solid #eee;
-        display: flex;
-        flex-direction: column;
-        gap: 12px;
-    }
-
-    .epub-input-readonly {
-        background: #eee !important;
-        color: #888;
-        font-size: 11px !important;
-        cursor: default;
-        border: 1px solid #ddd;
-        border-radius: 4px;
-        padding: 4px 8px;
-        width: 100%;
-    }
-
-    /* 自定义元数据 */
-    .epub-custom-meta-section {
-        margin-top: 16px;
-        padding-top: 16px;
-        border-top: 1px dashed #ddd;
-    }
-
-    .section-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 10px;
-        font-weight: bold;
-        color: #555;
-        font-size: 12px;
-    }
-
-    .custom-meta-row {
-        display: flex;
-        gap: 8px;
-        margin-bottom: 8px;
-    }
-
-    .custom-meta-row input {
-        flex: 1;
-        height: 28px;
-        font-size: 12px;
-        border: 1px solid #ddd;
-        border-radius: 4px;
-        padding: 0 8px;
-    }
-
-    .mini-icon-btn {
-        width: 24px;
-        height: 24px;
-        border-radius: 4px;
-        border: 1px solid #ddd;
-        background: white;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 10px;
-        color: #666;
-    }
-
-    .mini-icon-btn:hover {
-        background: #f5f5f5;
-        border-color: #bbb;
-    }
-
-    .mini-icon-btn.remove {
-        color: #ff4444;
-    }
-
-    .mini-icon-btn.remove:hover {
-        background: #fff5f5;
-        border-color: #ffcccc;
-    }
-
-    /* 底部操作 */
-    .epub-footer-actions {
+    .epub-modal-footer {
         display: flex;
         gap: 12px;
         margin-top: 10px;
     }
 
-    .epub-footer-actions .grid-btn {
+    .epub-modal-footer button {
         flex: 1;
         height: 40px;
         font-size: 14px;
