@@ -1273,9 +1273,9 @@
                                 class="icon-btn"
                                 title="全部展开/折叠"
                                 on:click={() => {
-                                    tocTree.forEach(
-                                        (n) => (n.expanded = !n.expanded),
-                                    );
+                                    const anyExpanded = tocTree.some(n => n.expanded);
+                                    const targetState = !anyExpanded;
+                                    tocTree.forEach(n => n.expanded = targetState);
                                     tocTree = [...tocTree];
                                 }}>⇅</button
                             >
