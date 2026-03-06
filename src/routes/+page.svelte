@@ -353,6 +353,7 @@
             cover_path: epubMeta.cover_path || "",
             description: "",
             styles: { ...epubMeta.styles },
+            assets: [...epubMeta.assets] as { name: string, path: string, category: string }[],
         };
 
         // 默认书名
@@ -458,7 +459,8 @@
                         publisher: epubMeta.publisher,
                         uuid: epubMeta.uuid,
                         md5: epubMeta.md5,
-                        styles: { ...epubMeta.styles }
+                        styles: { ...epubMeta.styles },
+                        assets: [...epubMeta.assets]
                     },
                     custom: customMetadata
                 });
@@ -471,6 +473,7 @@
                 epubMeta.uuid = meta.uuid;
                 epubMeta.md5 = meta.md5;
                 epubMeta.styles = { ...meta.styles };
+                epubMeta.assets = [...(meta.assets || [])];
                 customMetadata = [...custom];
 
                 if (persistCss) {
@@ -1182,6 +1185,13 @@
                 content: fileContent,
                 chapters,
                 metadata: {
+                    title: epubMeta.title,
+                    creator: epubMeta.creator,
+                    publisher: epubMeta.publisher,
+                    date: epubMeta.date,
+                    uuid: epubMeta.uuid,
+                    md5: epubMeta.md5,
+                    cover_path: epubMeta.cover_path,
                     description: epubMeta.description,
                     main_css: epubMeta.styles["main.css"],
                     font_css: epubMeta.styles["font.css"],
