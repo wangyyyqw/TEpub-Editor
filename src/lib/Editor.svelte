@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import { EditorView, basicSetup } from "codemirror";
   import { EditorState, Compartment, Prec } from "@codemirror/state";
-  import { keymap, drawSelection, Decoration } from "@codemirror/view";
+  import { keymap, drawSelection, Decoration, highlightWhitespace } from "@codemirror/view";
   import { undo, redo, indentWithTab } from "@codemirror/commands";
   import { search, setSearchQuery, SearchQuery, findNext, findPrevious, replaceNext, replaceAll, getSearchQuery } from "@codemirror/search";
   import { listen, emit } from "@tauri-apps/api/event";
@@ -17,12 +17,18 @@
     isAtBottom: boolean;
   }) => void;
   export let onSelectionChange: (line: number) => void = () => {};
+  export let wordWrap: boolean = true;
+  export let showWhitespace: boolean = false;
+  export let showLineBreaks: boolean = false;
 
   let editorElement: HTMLElement;
   let view: EditorView;
   let fontSize = 18;
   const themeCompartment = new Compartment();
   const titleCompartment = new Compartment();
+  const wrapCompartment = new Compartment();
+  const whiteSpaceCompartment = new Compartment();
+  const lineBreakCompartment = new Compartment();
 
   // 滚动节流状态
   let scrollThrottleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -77,6 +83,29 @@
   }
 
   let initError = "";
+
+  const lineBreakTheme = EditorView.theme({
+    ".cm-line": { position: "relative" },
+    ".cm-line::after": {
+        content: '"\\21B5"',
+        color: "rgba(120, 120, 120, 0.9)",
+        position: "absolute",
+        paddingLeft: "8px",
+        pointerEvents: "none",
+        userSelect: "none",
+        whiteSpace: "nowrap"
+    }
+  });
+
+  $: if (view) {
+    view.dispatch({
+      effects: [
+        wrapCompartment.reconfigure(wordWrap ? EditorView.lineWrapping : []),
+        whiteSpaceCompartment.reconfigure(showWhitespace ? highlightWhitespace() : []),
+        lineBreakCompartment.reconfigure(showLineBreaks ? lineBreakTheme : [])
+      ]
+    });
+  }
 
   onMount(() => {
     // 终极杀手锏：拦截无论在何时发生的异步算绘崩溃！
@@ -236,7 +265,9 @@
       doc: initialDoc,
       extensions: [
         basicSetup,
-        EditorView.lineWrapping,
+        wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
+        whiteSpaceCompartment.of(showWhitespace ? highlightWhitespace() : []),
+        lineBreakCompartment.of(showLineBreaks ? lineBreakTheme : []),
         Prec.highest(
           keymap.of([
             {

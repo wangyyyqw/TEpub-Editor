@@ -12,7 +12,8 @@
     interface RawChapter {
         title: string;
         line_number: number;
-        toc_type: "Volume" | "Chapter" | "Meta";
+        level: number;
+        is_meta: boolean;
         word_count: number;
     }
     interface TocNode {
@@ -24,6 +25,7 @@
         children: TocNode[];
         expanded: boolean;
         parentId?: string;
+        level?: number;
     }
     interface MatchLocation {
         line: number;
@@ -42,6 +44,7 @@
         title: string;
         type: "Volume" | "Chapter" | "Meta";
         word_count: number;
+        level?: number;
     }
     interface CheckItem {
         id: string;
@@ -58,16 +61,40 @@
         size: number;
     }
 
-    // --- [2. 默认配置 (三大正则回归)] ---
+    // --- [2. 默认配置 (三大正则回归 & 新增动态生成规则)] ---
+    interface CustomRegexRule {
+        level: number;
+        pattern: string;
+    }
+
     const DEFAULT_SETTINGS = {
-        volRegex: "^\\s*第[零一二三四五六七八九十百千万0-9]+[卷部].*",
-        chapRegex:
-            "^\\s*(第[一二三四五六七八九十百千万0-9]+(?:[章节]|回(?:[^合]|$))|Chapter\\s*\\d+).*",
-        metaRegex: "^\\s*(内容)?(简介|序[章言]?|前言|楔子|后记|完本感言).*", // 之前丢失的
+        customRegexRules: [
+            { level: 1, pattern: "^\\s*(内容)?(简介|序[章言]?|前言|楔子|后记|完本感言).*" },
+            { level: 1, pattern: "^\\s*第[零一二三四五六七八九十百千万0-9]+[卷部].*" },
+            { level: 3, pattern: "^\\s*(第[一二三四五六七八九十百千万0-9]+(?:[章节]|回(?:[^合]|$))|Chapter\\s*\\d+).*" }
+        ] as CustomRegexRule[],
         wordCountThreshold: 8000,
         clearHistoryOnSave: false,
         defaultEpubStyles: { "main.css": "", "font.css": "" },
+        wordWrap: true,
+        showWhitespace: false,
+        showLineBreaks: false,
+        // Legacy fallbacks for compatibility
+        volRegex: "^\\s*第[零一二三四五六七八九十百千万0-9]+[卷部].*",
+        chapRegex: "^\\s*(第[一二三四五六七八九十百千万0-9]+(?:[章节]|回(?:[^合]|$))|Chapter\\s*\\d+).*",
+        metaRegex: "^\\s*(内容)?(简介|序[章言]?|前言|楔子|后记|完本感言).*",
     };
+
+    const REGEX_PRESETS = [
+        { label: "自定义", value: "" },
+        { label: "^\\s*第[一二三..]+章.*$", value: "^\\s*第[一二三四五六七八九十零〇百千两]+章.*$" },
+        { label: "^\\s*第[一二三..]+卷.*$", value: "^\\s*第[一二三四五六七八九十零〇百千两]+卷.*$" },
+        { label: "^\\s*第[一二三..]+回.*$", value: "^\\s*第[一二三四五六七八九十零〇百千两]+回.*$" },
+        { label: "^\\s*第[一二三..]+节.*$", value: "^\\s*第[一二三四五六七八九十零〇百千两]+节.*$" },
+        { label: "^\\s*第\\d+章.*$", value: "^\\s*第\\d+章.*$" },
+        { label: "^\\s*(序[1-9言曲]?|(内容)?简介|后记|尾声)$", value: "^\\s*(序[1-9言曲]?|(内容)?简介|后记|尾声)$" },
+        { label: "^\\s*\\d+\\s*$", value: "^\\s*\\d+\\s*$" }
+    ];
 
     // --- [3. 核心状态] ---
     let filePath = "请打开一本小说...";
@@ -93,6 +120,7 @@
 
     // 面板显示状态
     let showSettingsPanel = false;
+    let settingsActiveTab = "display"; // 'display' | 'toc'
     let showEpubModal = false;
     let showCheckPanel = false;
     let showHistoryPanel = false;
@@ -127,7 +155,7 @@
     let currentMatchIndex = -1;
 
     // 内容检查状态
-    let isCheckModeOn = false;
+    let isCheckModeOn = true;
     let invalidSequenceIds = new Set<string>();
     let sequenceErrors: CheckItem[] = [];
     let wordCountErrors: CheckItem[] = [];
@@ -204,6 +232,14 @@
     }
 
     onMount(() => {
+        console.log("App mounting...");
+        window.addEventListener("error", (e) => {
+            console.error("Global Error Caught:", e.message, e.error);
+        });
+        window.addEventListener("unhandledrejection", (e) => {
+            console.error("Unhandled Promise Rejection:", e.reason);
+        });
+
         let unlistenClose: any;
 
         const init = async () => {
@@ -245,18 +281,34 @@
             const stored = localStorage.getItem("app-settings");
             if (stored) {
                 try {
-                    appSettings = { ...DEFAULT_SETTINGS, ...JSON.parse(stored) };
-                    // 迁移旧版正则：将 [章回] 替换为排除"回合"的模式
-                    if (appSettings.chapRegex.includes("[章回]")) {
-                        appSettings.chapRegex = appSettings.chapRegex.replace(
-                            "[章回]",
-                            "(?:[章节]|回(?:[^合]|$))",
-                        );
-                        localStorage.setItem(
-                            "app-settings",
-                            JSON.stringify(appSettings),
-                        );
+                    let parsed = JSON.parse(stored);
+                    appSettings = { ...DEFAULT_SETTINGS, ...parsed };
+                    
+                    // 核心初始化：确保 customRegexRules 存在并按照预期结构映射
+                    if (!appSettings.customRegexRules || !Array.isArray(appSettings.customRegexRules)) {
+                        appSettings.customRegexRules = [
+                            { level: 1, pattern: appSettings.metaRegex || DEFAULT_SETTINGS.metaRegex },
+                            { level: 1, pattern: appSettings.volRegex || DEFAULT_SETTINGS.volRegex },
+                            { level: 3, pattern: appSettings.chapRegex || DEFAULT_SETTINGS.chapRegex }
+                        ];
+                    } else {
+                        // 迁移：如果包含 type，无缝转换为 level
+                        appSettings.customRegexRules = appSettings.customRegexRules.map((r: any) => {
+                            if (typeof r.type === "string") {
+                                let level = 3;
+                                if (r.type === "Volume" || r.type === "Meta") level = 1;
+                                return { level, pattern: r.pattern };
+                            }
+                            return r;
+                        });
                     }
+
+                    // 迁移旧版正则：将 [章回] 替换为排除"回合"的模式
+                    appSettings.customRegexRules.forEach(r => {
+                        if (r.pattern && r.pattern.includes("[章回]")) {
+                            r.pattern = r.pattern.replace("[章回]", "(?:[章节]|回(?:[^合]|$))");
+                        }
+                    });
                 } catch (e) {}
             }
 
@@ -634,6 +686,7 @@
                 isModified = false;
                 updateMd5(content);
                 await scanToc(content);
+                if (isCheckModeOn) runFullCheck();
 
                 isLoading = false;
                 localStorage.removeItem("app-crash-recovery");
@@ -718,51 +771,70 @@
             // 调用 Rust 正则扫描
             const rawList = await invoke<RawChapter[]>("scan_chapters", {
                 content: text,
-                volreg: appSettings.volRegex,
-                chapreg: appSettings.chapRegex,
-                metareg: appSettings.metaRegex,
+                rules: appSettings.customRegexRules,
             });
 
             const tree: TocNode[] = [];
             flatToc = [];
-            let curVol: TocNode | null = null;
             let uid = 0;
+            let parentStack: TocNode[] = [];
 
             // 构建嵌套树
             for (const item of rawList) {
+                // Determine legacy type for UI styling backward compatibility
+                const computedType = item.is_meta ? "Meta" : (item.level === 1 ? "Volume" : "Chapter");
+                
                 const node: TocNode = {
                     id: `n-${uid++}`,
                     title: item.title,
                     line_number: item.line_number,
-                    type: item.toc_type,
+                    type: computedType,
                     word_count: item.word_count,
                     children: [],
                     expanded: true,
                 };
 
-                // 压平数组用于滚动查找
                 const flatNode: FlatNode = {
                     id: node.id,
                     line: node.line_number,
                     title: node.title,
-                    type: node.type,
+                    type: computedType,
                     word_count: node.word_count,
                 };
 
-                if (item.toc_type === "Volume") {
-                    curVol = node;
-                    tree.push(node);
-                    flatToc.push(flatNode);
-                } else if (item.toc_type === "Chapter" && curVol) {
-                    node.parentId = curVol.id;
-                    curVol.children.push(node);
-                    flatNode.parentId = curVol.id;
-                    flatToc.push(flatNode);
+                // Remove parents that are closed by this node
+                while (parentStack.length > 0) {
+                    let top = parentStack[parentStack.length - 1];
+                    // If the parent is not Meta, and its level is STRICTLY smaller, it IS a valid parent.
+                    // Wait, our level is 1..5. Smaller number = higher level (like h1). 
+                    // So valid parent must have level < item.level.
+                    // Example: Volume is level 1. Chapter is level 3. Parent (1) < Node (3).
+                    // If we encounter another Level 1, we pop the previous Level 1 because 1 is not < 1.
+                    if (top.level !== undefined && top.level < item.level && top.type !== "Meta") {
+                        break;
+                    }
+                    if (top.type === "Volume" && item.level > 1) {
+                        break; // Fallback for safely catching missing level property in old node trees
+                    }
+                    parentStack.pop();
+                }
+
+                if (parentStack.length > 0) {
+                    let parent = parentStack[parentStack.length - 1];
+                    // Only volume nodes act as parents in the tree representation 
+                    node.parentId = parent.id;
+                    parent.children.push(node);
+                    flatNode.parentId = parent.id;
                 } else {
                     tree.push(node);
-                    flatToc.push(flatNode);
                 }
+
+                // Add non-meta elements to stack using dynamic levels
+                (node as any).level = item.level;
+                parentStack.push(node);
+                flatToc.push(flatNode);
             }
+            flatToc = [...flatToc];
             tocTree = tree;
 
             // 更新统计
@@ -1017,7 +1089,7 @@
                             id: node.id,
                             title: node.title,
                             line: node.line,
-                            msg: `跳跃: ${lastNum}->${num}`,
+                            msg: `(${lastNum}-${num})`,
                             val: num,
                         });
                     }
@@ -1167,9 +1239,7 @@
 
             let chapters = await invoke<RawChapter[]>("scan_chapters", {
                 content: fileContent,
-                volreg: appSettings.volRegex,
-                chapreg: appSettings.chapRegex,
-                metareg: appSettings.metaRegex,
+                rules: appSettings.customRegexRules,
             });
 
             // 智能清洗
@@ -1260,7 +1330,9 @@
     />
 </svelte:head>
 
-<ContextMenu />
+
+<!-- <ContextMenu /> --> <!-- Removed duplicate at top -->
+
 
 <main class="app-container" on:contextmenu|preventDefault>
     <header class="toolbar">
@@ -1382,7 +1454,11 @@
                                     ? 'text-error'
                                     : ''}">{node.title}</span
                             >
-                            <span class="toc-count">{node.word_count}</span>
+                            <span class="toc-count"
+                                >{node.type === "Volume"
+                                    ? node.children.length
+                                    : node.word_count}</span
+                            >
                         </div>
 
                         {#if node.expanded}
@@ -1407,8 +1483,7 @@
                                             child.id,
                                         )
                                             ? 'text-error'
-                                            : ''}">{child.title}</span
-                                    >
+                                            : ''}">{child.title}</span>
                                     <span class="toc-count"
                                         >{child.word_count}</span
                                     >
@@ -1435,6 +1510,9 @@
                 }}
                 onScroll={handleScroll}
                 onSelectionChange={handleSelectionChange}
+                wordWrap={appSettings.wordWrap}
+                showWhitespace={appSettings.showWhitespace}
+                showLineBreaks={appSettings.showLineBreaks}
             />
         </section>
     </div>
@@ -1457,63 +1535,115 @@
                             >✕</button
                         >
                     </div>
+                    
+                    <div class="settings-tabs">
+                        <button class="tab-btn {settingsActiveTab === 'display' ? 'active' : ''}" on:click={() => settingsActiveTab = 'display'}>显示</button>
+                        <button class="tab-btn {settingsActiveTab === 'toc' ? 'active' : ''}" on:click={() => settingsActiveTab = 'toc'}>目录</button>
+                    </div>
                     <div class="p-body">
-                        <div class="set-row">
-                            <label for="vreg">卷正则:</label><input
-                                id="vreg"
-                                type="text"
-                                bind:value={appSettings.volRegex}
-                            />
-                        </div>
-                        <div class="set-row">
-                            <label for="creg">章正则:</label><input
-                                id="creg"
-                                type="text"
-                                bind:value={appSettings.chapRegex}
-                            />
-                        </div>
-                        <div class="set-row">
-                            <label for="mreg">Meta正则:</label><input
-                                id="mreg"
-                                type="text"
-                                bind:value={appSettings.metaRegex}
-                            />
-                        </div>
-                        <!-- 合并：字数阈值 和 撤销开关 -->
-                        <div class="set-row">
-                            <label for="wth">字数阈值:</label>
-                            <input
-                                id="wth"
-                                type="number"
-                                bind:value={appSettings.wordCountThreshold}
-                                style="flex:1"
-                            />
-
-                            <div
-                                style="display:flex; align-items:center; margin-left:10px; flex-shrink:0;"
-                            >
-                                <label
-                                    for="clh"
-                                    style="width:auto; margin-right:5px; font-weight:normal;"
-                                    >保存清空撤销</label
-                                >
+                        {#if settingsActiveTab === 'display'}
+                            <div class="set-row">
+                                <label for="wordWrap">自动换行:</label>
+                                <input id="wordWrap" type="checkbox" bind:checked={appSettings.wordWrap} style="width: auto;"/>
+                            </div>
+                            <div class="set-row">
+                                <label for="showWhitespace">显示空格:</label>
+                                <input id="showWhitespace" type="checkbox" bind:checked={appSettings.showWhitespace} style="width: auto;"/>
+                            </div>
+                            <div class="set-row">
+                                <label for="showLineBreaks">显示换行符:</label>
+                                <input id="showLineBreaks" type="checkbox" bind:checked={appSettings.showLineBreaks} style="width: auto;"/>
+                            </div>
+                            <!-- 撤销开关 -->
+                            <div class="set-row">
+                                <label for="wth">单章字数检查:</label>
                                 <input
-                                    id="clh"
-                                    type="checkbox"
-                                    bind:checked={
-                                        appSettings.clearHistoryOnSave
-                                    }
-                                    style="width:auto !important; margin:0;"
+                                    id="wth"
+                                    type="number"
+                                    bind:value={appSettings.wordCountThreshold}
+                                    style="width: 80px;"
                                 />
                             </div>
-                        </div>
+                            
+                            <div class="set-row">
+                                <label for="clh">保存清空撤销:</label>
+                                <input id="clh" type="checkbox" bind:checked={appSettings.clearHistoryOnSave} style="width: auto;"/>
+                            </div>
+                        {:else}
+                            <div class="rules-header">正则表达式</div>
+                            <div class="rules-list">
+                                {#each appSettings.customRegexRules as rule, idx}
+                                    <div class="rule-item" style="gap: 8px; align-items: center;">
+                                        <select class="rule-type" bind:value={rule.level} style="width: 80px; flex-shrink: 0;">
+                                            <option value={1}>层级 1</option>
+                                            <option value={2}>层级 2</option>
+                                            <option value={3}>层级 3</option>
+                                            <option value={4}>层级 4</option>
+                                            <option value={5}>层级 5</option>
+                                        </select>
+                                        
+                                        <div class="rule-input-group">
+                                            <input
+                                                class="rule-input"
+                                                type="text"
+                                                bind:value={rule.pattern}
+                                                placeholder="输入正则表达式"
+                                            />
+                                            <div class="rule-arrow-visual">▼</div>
+                                            <select
+                                                class="rule-hidden-select"
+                                                on:change={(e) => {
+                                                    const val = e.currentTarget.value;
+                                                    if(val) rule.pattern = val;
+                                                    e.currentTarget.value = "";
+                                                }}
+                                            >
+                                                <option value="">选择预设正则</option>
+                                                {#each REGEX_PRESETS as preset}
+                                                    {#if preset.value}
+                                                        <option value={preset.value}>{preset.value}</option>
+                                                    {/if}
+                                                {/each}
+                                            </select>
+                                        </div>
 
-                        <!-- 底部按钮：放在一行 -->
-                        <div style="display:flex; gap:10px; margin-top:10px;">
+                                        <button class="rule-btn remove" on:click={() => {
+                                            appSettings.customRegexRules.splice(idx, 1);
+                                            appSettings.customRegexRules = [...appSettings.customRegexRules];
+                                        }}>－</button>
+                                    </div>
+                                {/each}
+                            </div>
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px;">
+                                <button class="grid-btn" style="padding: 4px 10px; font-size: 13px;" on:click={() => {
+                                    appSettings.customRegexRules = [
+                                        { level: 1, pattern: DEFAULT_SETTINGS.metaRegex },
+                                        { level: 1, pattern: DEFAULT_SETTINGS.volRegex },
+                                        { level: 3, pattern: DEFAULT_SETTINGS.chapRegex }
+                                    ];
+                                }}>↺ 还原正则</button>
+                                <button class="grid-btn" style="padding: 4px 10px; font-size: 13px; color: #0066b8; border-color: #0066b8;" on:click={() => {
+                                    appSettings.customRegexRules.push({ level: 3, pattern: "" });
+                                    appSettings.customRegexRules = [...appSettings.customRegexRules];
+                                }}>＋ 新增正则</button>
+                            </div>
+
+                        {/if}
+
+                        <!-- 底部通用按钮：放在一行，且放在 if/else 外部 -->
+                        <div style="display:flex; gap:10px; margin-top:15px;">
                             <button
                                 class="grid-btn blue"
                                 style="flex:1;"
                                 on:click={() => {
+                                    // Backward compatibility: keep legacy string arrays synced for older clients, ignoring them in main logic
+                                    try {
+                                        const vols = appSettings.customRegexRules.filter(r => r.level === 1).map(r => `(${r.pattern})`);
+                                        const chaps = appSettings.customRegexRules.filter(r => r.level >= 2).map(r => `(${r.pattern})`);
+                                        appSettings.volRegex = vols.length > 0 ? vols.join("|") : "^$"; 
+                                        appSettings.chapRegex = chaps.length > 0 ? chaps.join("|") : "^$";
+                                    } catch (e) {}
+
                                     localStorage.setItem(
                                         "app-settings",
                                         JSON.stringify(appSettings),
@@ -1730,7 +1860,7 @@
                         on:click={() => (checkCollapseState.seq = !checkCollapseState.seq)}
                         on:keydown={(e) => e.key === 'Enter' && (checkCollapseState.seq = !checkCollapseState.seq)}
                     >
-                        <span>{checkCollapseState.seq ? "▶" : "▼"} 章节序号不连贯 ({sequenceErrors.length})</span>
+                        <span>{checkCollapseState.seq ? "▶" : "▼"} 断序检查 ({sequenceErrors.length})</span>
                     </div>
                     {#if !checkCollapseState.seq}
                         <div class="tag-list">
@@ -1739,8 +1869,8 @@
                                     class="err-tag"
                                     on:click={() => handleChapterClick(e.id, e.line)}
                                 >
+                                    <span class="err-tag-msg">{e.msg}</span>
                                     <span class="err-tag-title">{e.title}</span>
-                                    <span class="err-tag-msg">({e.msg})</span>
                                 </button>
                             {:else}<span class="toc-count">无</span>{/each}
                         </div>
@@ -1756,7 +1886,7 @@
                         on:click={() => (checkCollapseState.title = !checkCollapseState.title)}
                         on:keydown={(e) => e.key === 'Enter' && (checkCollapseState.title = !checkCollapseState.title)}
                     >
-                        <span>{checkCollapseState.title ? "▶" : "▼"} 标题空内容 ({titleErrors.length})</span>
+                        <span>{checkCollapseState.title ? "▶" : "▼"} 标题内容 ({titleErrors.length})</span>
                     </div>
                     {#if !checkCollapseState.title}
                         <div class="tag-list">
@@ -1779,7 +1909,7 @@
                         on:click={() => (checkCollapseState.word = !checkCollapseState.word)}
                         on:keydown={(e) => e.key === 'Enter' && (checkCollapseState.word = !checkCollapseState.word)}
                     >
-                        <span>{checkCollapseState.word ? "▶" : "▼"} 字数超标 ({wordCountErrors.length})</span>
+                        <span>{checkCollapseState.word ? "▶" : "▼"} 字数检查 ({wordCountErrors.length})</span>
                     </div>
                     {#if !checkCollapseState.word}
                         <div class="tag-list">
@@ -1881,7 +2011,6 @@
         font-weight: 500;
         font-size: 14px;
     }
-
     .btn.primary {
         background: #2196f3;
         color: white;
@@ -1895,6 +2024,24 @@
     .btn.secondary {
         background: #e0e0e0;
         color: #333;
+    }
+
+
+
+    .set-row {
+        display: flex;
+        align-items: center;
+        margin-bottom: 12px;
+        gap: 12px;
+    }
+    .set-row label {
+        color: #444;
+        font-size: 14px;
+    }
+    .set-row input[type="checkbox"] {
+        width: 16px;
+        height: 16px;
+        cursor: pointer;
     }
 
     :global(body) {
@@ -2118,10 +2265,10 @@
         user-select: none;
     }
     .p-body {
-        padding: 20px;
+        padding: 15px;
         display: flex;
         flex-direction: column;
-        gap: 16px;
+        gap: 8px;
     }
     .set-row {
         display: flex;
@@ -2153,7 +2300,7 @@
         justify-content: center;
         z-index: 2000;
         padding: 20px;
-        backdrop-filter: blur(2px);
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
     }
     .modal-content {
         background: #fff;
@@ -2164,6 +2311,122 @@
         display: flex;
         flex-direction: column;
         box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+    }
+
+    /* 偏好设置面板增强样式 */
+    .settings-tabs {
+        display: flex;
+        gap: 15px;
+        padding: 5px 20px 10px;
+        border-bottom: 1px solid #eee;
+    }
+    .settings-tabs .tab-btn {
+        background: none;
+        border: none;
+        border-radius: 6px;
+        padding: 6px 14px;
+        font-size: 15px;
+        font-weight: bold;
+        color: #777;
+        cursor: pointer;
+        transition: 0.2s;
+        height: auto;
+        min-width: 0;
+    }
+    .settings-tabs .tab-btn:hover {
+        background: #f0f0f0;
+    }
+    .settings-tabs .tab-btn.active {
+        color: #0066b8;
+        background: #e3f2fd;
+    }
+
+    .rules-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+    }
+    .rule-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+    .rule-type {
+        width: 85px;
+        height: 32px;
+        padding: 0 5px;
+        border: 1px solid #ccc;
+        border-radius: 6px;
+        font-size: 13px;
+        background: #fff;
+    }
+    .rule-input-group {
+        display: flex;
+        flex: 1;
+        align-items: center;
+        position: relative;
+    }
+    .rule-input {
+        flex: 1;
+        height: 32px;
+        padding: 0 10px;
+        border: 1px solid #ccc;
+        border-right: none;
+        border-radius: 6px 0 0 6px;
+        font-size: 13px;
+        background: #fff;
+        min-width: 0;
+        z-index: 1;
+    }
+    .rule-arrow-visual {
+        width: 32px;
+        height: 32px;
+        border: 1px solid #ccc;
+        border-radius: 0 6px 6px 0;
+        background: #f9f9f9;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #666;
+        font-size: 10px;
+        flex-shrink: 0;
+    }
+    .rule-hidden-select {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        opacity: 0;
+        appearance: none;
+        -webkit-appearance: none;
+        cursor: pointer;
+        z-index: 2;
+        clip-path: inset(0 0 0 calc(100% - 32px));
+    }
+    .rule-btn {
+        width: 32px;
+        height: 32px;
+        min-width: 32px;
+        border: 1px solid #ccc;
+        border-radius: 6px;
+        background: #fff;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: 0.1s;
+    }
+    .rule-btn:hover {
+        background: #fee;
+        color: #d32f2f;
+        border-color: #ffcdd2;
+    }
+    .rules-header {
+        font-size: 13px;
+        font-weight: bold;
+        color: #666;
+        margin-bottom: 5px;
     }
 
     /* EPUB 制作面板重构样式 */
@@ -2286,5 +2549,110 @@
         flex: 1;
         height: 40px;
         font-size: 14px;
+    }
+
+    /* 检查面板样式 */
+    .check-panel {
+        position: fixed;
+        width: 300px;
+        background: rgba(255, 255, 255, 0.95);
+        backdrop-filter: blur(8px);
+        border: 1px solid rgba(0, 0, 0, 0.1);
+        border-radius: 12px;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+        z-index: 1000;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+    }
+    .check-sec {
+        padding: 8px 12px;
+        border-bottom: 1px solid #eee;
+    }
+    .check-sec:last-child {
+        border-bottom: none;
+    }
+    .sec-title {
+        font-size: 13px;
+        font-weight: bold;
+        color: #444;
+        cursor: pointer;
+        padding: 4px 0;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }
+    .tag-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        padding: 8px 0;
+    }
+    .err-tag {
+        background: #fff5f5;
+        border: 1px solid #ffcdd2;
+        border-radius: 6px;
+        padding: 6px 10px;
+        font-size: 12px;
+        color: #d32f2f;
+        cursor: pointer;
+        text-align: left;
+        line-height: 1.4;
+        transition: 0.2s;
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        gap: 8px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        justify-content: flex-start;
+    }
+    .err-tag:hover {
+        background: #ffebee;
+        border-color: #ef5350;
+    }
+    .err-tag-title {
+        font-weight: bold;
+    }
+    .err-tag-msg {
+        font-size: 11px;
+        color: #f44336;
+        font-weight: bold;
+        font-family: monospace;
+    }
+    
+    .find-header {
+        padding: 10px 14px;
+        background: #f8fafc;
+        border-bottom: 1px solid #eee;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        cursor: move;
+    }
+    .find-title {
+        font-size: 14px;
+        font-weight: bold;
+        color: #333;
+    }
+    .icon-close {
+        background: none;
+        border: none;
+        font-size: 16px;
+        color: #999;
+        cursor: pointer;
+        padding: 4px;
+        min-width: 0;
+    }
+    .icon-close:hover {
+        color: #f44336;
+    }
+    .scroll-p::-webkit-scrollbar {
+        width: 6px;
+    }
+    .scroll-p::-webkit-scrollbar-thumb {
+        background: #ddd;
+        border-radius: 3px;
     }
 </style>

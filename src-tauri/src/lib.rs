@@ -31,12 +31,6 @@ impl EpubCache {
             temp_dir: None,
         }
     }
-
-    fn clear(&mut self) {
-        self.text_cache.clear();
-        self.binary_cache.clear();
-        self.temp_dir = None;
-    }
 }
 
 static EPUB_CACHE: Lazy<Mutex<Option<EpubCache>>> = Lazy::new(|| Mutex::new(None));
@@ -512,21 +506,6 @@ div.roundsolid2 {
 
 // --- 数据结构 ---
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-enum TocType {
-    Volume,
-    Chapter,
-    Meta,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct ChapterInfo {
-    title: String,
-    line_number: usize,
-    toc_type: TocType,
-    word_count: usize,
-}
-
 #[derive(Serialize, Clone, Copy)]
 struct MatchLocation {
     line: usize,
@@ -659,10 +638,6 @@ fn read_text_file(path: String) -> Result<String, String> {
         ("big5", encoding_rs::BIG5),
     ];
 
-    let mut min_errors = usize::MAX;
-    let mut best_content = String::new();
-    let mut best_encoding = "utf-8";
-
     // 1. 优先尝试 UTF-8 (严格)
     if let Ok(s) = String::from_utf8(buffer.clone()) {
         return Ok(normalize_line_endings(s));
@@ -676,13 +651,13 @@ fn read_text_file(path: String) -> Result<String, String> {
     let (cow_detected, _, malformed_detected) = detected_encoding.decode(&buffer);
     let errors_detected = cow_detected.chars().filter(|&c| c == '\u{FFFD}').count();
 
-    best_content = cow_detected.into_owned();
-    min_errors = if malformed_detected {
+    let mut best_content = cow_detected.into_owned();
+    let mut min_errors = if malformed_detected {
         errors_detected
     } else {
         0
     };
-    best_encoding = detected_encoding.name();
+    let mut best_encoding = detected_encoding.name();
 
     // 如果检测结果完美且不是 windows-1252 (容易误判)，直接返回
     if min_errors == 0 && best_encoding != "windows-1252" && best_encoding != "ISO-8859-1" {
@@ -795,12 +770,25 @@ async fn get_history_list(original_path: String) -> Vec<HistoryMeta> {
     list
 }
 
+#[derive(serde::Deserialize, Clone)]
+pub struct RegexRule {
+    pub level: u8,
+    pub pattern: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct ChapterInfo {
+    pub title: String,
+    pub line_number: usize,
+    pub level: u8,
+    pub is_meta: bool,
+    pub word_count: usize,
+}
+
 #[tauri::command]
 async fn scan_chapters(
     content: String,
-    volreg: String,
-    chapreg: String,
-    metareg: String,
+    rules: Vec<RegexRule>,
 ) -> Vec<ChapterInfo> {
     // Normalize line endings to ensure consistency with CodeMirror's line counting
     // CodeMirror treats \r, \n, and \r\n all as line separators
@@ -812,41 +800,51 @@ async fn scan_chapters(
         .replace('\u{2029}', "\n");
 
     let mut chapters = Vec::new();
-    let re_volume = Regex::new(&volreg).unwrap_or_else(|_| {
-        Regex::new(r"^\s*第[零一二三四五六七八九十百千万0-9]+[卷部].*").unwrap()
-    });
-    let re_chapter = Regex::new(&chapreg).unwrap_or_else(|_| {
-        Regex::new(r"^\s*(第[一二三四五六七八九十百千万0-9]+[章回]|Chapter\s*\d+).*").unwrap()
-    });
-    let re_meta = Regex::new(&metareg).unwrap_or_else(|_| {
-        Regex::new(r"^\s*(内容)?(简介|序[章言]?|前言|楔子|后记|完本感言).*").unwrap()
-    });
+    
+    // Compile regex rules safely
+    let compiled_rules: Vec<(u8, Regex)> = rules
+        .into_iter()
+        .filter_map(|r| Regex::new(&r.pattern).ok().map(|re| (r.level, re)))
+        .collect();
+
     let mut current_chapter: Option<ChapterInfo> = None;
     for (index, line) in content.lines().enumerate() {
         let line_trim = line.trim();
         let char_count = line_trim.chars().count();
         let is_empty = line_trim.is_empty();
-        let toc_type = if !is_empty && char_count <= 60 {
-            if re_volume.is_match(line).unwrap_or(false) {
-                Some(TocType::Volume)
-            } else if re_meta.is_match(line).unwrap_or(false) {
-                Some(TocType::Meta)
-            } else if re_chapter.is_match(line).unwrap_or(false) {
-                Some(TocType::Chapter)
-            } else {
-                None
+        
+        let mut match_level = None;
+        if !is_empty {
+            for (level, re) in &compiled_rules {
+                if re.is_match(line).unwrap_or(false) {
+                    match_level = Some(*level);
+                    break;
+                }
             }
-        } else {
-            None
-        };
-        if let Some(t) = toc_type {
+        }
+
+        if let Some(lvl) = match_level {
             if let Some(prev) = current_chapter.take() {
                 chapters.push(prev);
             }
+            // Auto detect meta to prevent folding chapters into introductions
+            // But ensure Volumes (Level 1 containing 卷/部) are NOT treated as meta
+            // And only auto-detect meta for Level 1 items (Chapters at Level 3 should not be meta)
+            let is_vol_keyword = line_trim.contains("卷") || line_trim.contains("部");
+            let is_meta = (lvl == 1) && !is_vol_keyword && (
+                          line_trim.contains("简介") 
+                       || line_trim.contains("前言") 
+                       || line_trim.contains("序") 
+                       || line_trim.contains("楔子") 
+                       || line_trim.contains("后记") 
+                       || line_trim.contains("感言")
+                       || line_trim.contains("内容"));
+            
             current_chapter = Some(ChapterInfo {
                 title: line_trim.to_string(),
                 line_number: index + 1,
-                toc_type: t,
+                level: lvl,
+                is_meta,
                 word_count: 0,
             });
         } else {
@@ -997,7 +995,6 @@ async fn export_epub(
     let mut spine_refs = String::new();
     let mut ncx_navpoints = String::new();
     let mut play_order = 1;
-    let mut open_volume = false;
 
     if has_cover {
         let mime = if cover_ext == "png" {
@@ -1079,44 +1076,89 @@ async fn export_epub(
             escape_xml(&chapter.title)
         };
 
-        match chapter.toc_type {
-            TocType::Volume => {
-                class_attr = "Preface1";
-                let safe_vol_num = escape_xml(&chap_num_raw);
-                let safe_vol_name = escape_xml(&chap_name_raw);
-                let vertical_num = format_vertical_volume(&safe_vol_num);
-                let formatted_name = safe_vol_name
-                    .chars()
-                    .map(|c| format!("{} ", c))
-                    .collect::<String>();
-                html_body.push_str(&format!(
-                    "  <h1 class=\"PrefacehA1\" title=\"{}\"><br /><br />\n  {}</h1>\n  <p class=\"PrefacepA1\">{}</p>\n", 
-                    safe_display_title, vertical_num, formatted_name.trim()
-                ));
-            }
-            TocType::Chapter => {
-                let safe_chap_num = escape_xml(&chap_num_raw);
-                let safe_chap_name = escape_xml(&chap_name_raw);
-                html_body.push_str(&format!(
-                    "  <h3 class=\"head\"><span class=\"num\">{}</span><br/><b>{}</b></h3>\n",
-                    safe_chap_num, safe_chap_name
-                ));
-                for line in body_lines {
-                    let trim = line.trim();
-                    if !trim.is_empty() {
-                        html_body.push_str(&format!("  <p>{}</p>\n", escape_xml(trim)));
-                    }
+        if chapter.is_meta {
+            html_body.push_str(&format!(
+                "  <h1 class=\"nrjj-title\">{}</h1>\n",
+                safe_display_title
+            ));
+            for line in body_lines {
+                let trim = line.trim();
+                if !trim.is_empty() {
+                    html_body.push_str(&format!("  <p>{}</p>\n", escape_xml(trim)));
                 }
             }
-            TocType::Meta => {
-                html_body.push_str(&format!(
-                    "  <h1 class=\"nrjj-title\">{}</h1>\n",
-                    safe_display_title
-                ));
-                for line in body_lines {
-                    let trim = line.trim();
-                    if !trim.is_empty() {
-                        html_body.push_str(&format!("  <p>{}</p>\n", escape_xml(trim)));
+        } else {
+            match chapter.level {
+                1 => {
+                    class_attr = "Preface1";
+                    let safe_vol_num = escape_xml(&chap_num_raw);
+                    let safe_vol_name = escape_xml(&chap_name_raw);
+                    
+                    // We only use the vertical number styling if there's actually a volume number parsed
+                    let vertical_num = if !safe_vol_num.is_empty() {
+                        format_vertical_volume(&safe_vol_num)
+                    } else {
+                        String::new()
+                    };
+                    
+                    let formatted_name = if !safe_vol_name.is_empty() {
+                        safe_vol_name
+                            .chars()
+                            .map(|c| format!("{} ", c))
+                            .collect::<String>()
+                    } else {
+                        safe_display_title.clone()
+                            .chars()
+                            .map(|c| format!("{} ", c))
+                            .collect::<String>()
+                    };
+
+                    html_body.push_str(&format!(
+                        "  <h1 class=\"PrefacehA1\" title=\"{}\"><br /><br />\n  {}</h1>\n  <p class=\"PrefacepA1\">{}</p>\n", 
+                        safe_display_title, vertical_num, formatted_name.trim()
+                    ));
+                    
+                    // Add body content for Volume if they exist, to prevent loss of potential inner-body text
+                    for line in body_lines {
+                        let trim = line.trim();
+                        if !trim.is_empty() {
+                            html_body.push_str(&format!("  <p>{}</p>\n", escape_xml(trim)));
+                        }
+                    }
+                }
+                3 => {
+                    let safe_chap_num = escape_xml(&chap_num_raw);
+                    let safe_chap_name = escape_xml(&chap_name_raw);
+                    
+                    if !safe_chap_num.is_empty() {
+                        html_body.push_str(&format!(
+                            "  <h3 class=\"head\"><span class=\"num\">{}</span><br/><b>{}</b></h3>\n",
+                            safe_chap_num, safe_chap_name
+                        ));
+                    } else {
+                        html_body.push_str(&format!(
+                            "  <h3 class=\"head\">{}</h3>\n",
+                            safe_display_title
+                        ));
+                    }
+                    
+                    for line in body_lines {
+                        let trim = line.trim();
+                        if !trim.is_empty() {
+                            html_body.push_str(&format!("  <p>{}</p>\n", escape_xml(trim)));
+                        }
+                    }
+                }
+                _ => {
+                    html_body.push_str(&format!(
+                        "  <h{} class=\"head\">{}</h{}>\n",
+                        chapter.level, safe_display_title, chapter.level
+                    ));
+                    for line in body_lines {
+                        let trim = line.trim();
+                        if !trim.is_empty() {
+                            html_body.push_str(&format!("  <p>{}</p>\n", escape_xml(trim)));
+                        }
                     }
                 }
             }
@@ -1154,38 +1196,44 @@ async fn export_epub(
             id, href_in_opf
         ));
         spine_refs.push_str(&format!(r#"<itemref idref="{}"/>"#, id));
+    }
 
-        if chapter.toc_type == TocType::Volume {
-            if open_volume {
-                ncx_navpoints.push_str("</navPoint>\n");
-            }
-            ncx_navpoints.push_str(&format!(
-                r#"<navPoint id="navPoint-{}" playOrder="{}"><navLabel><text>{}</text></navLabel><content src="{}"/>"#,
-                play_order, play_order, safe_display_title, href_in_opf
-            ));
-            ncx_navpoints.push('\n');
-            open_volume = true;
-        } else if chapter.toc_type == TocType::Chapter {
-            ncx_navpoints.push_str(&format!(
-                r#"<navPoint id="navPoint-{}" playOrder="{}"><navLabel><text>{}</text></navLabel><content src="{}"/></navPoint>"#,
-                play_order, play_order, safe_display_title, href_in_opf
-            ));
-            ncx_navpoints.push('\n');
+    let mut nav_stack_levels: Vec<u8> = Vec::new();
+
+    for (i, chapter) in chapters.iter().enumerate() {
+        let href_in_opf = format!("Text/chapter{}.xhtml", i);
+        let current_level = chapter.level;
+        let (chap_num_raw, chap_name_raw) = split_title(&chapter.title);
+        let safe_display_title = if !chap_num_raw.is_empty() && !chap_name_raw.is_empty() {
+            format!("{} {}", escape_xml(&chap_num_raw), escape_xml(&chap_name_raw))
         } else {
-            if open_volume {
+            escape_xml(&chapter.title)
+        };
+
+        while let Some(&top_level) = nav_stack_levels.last() {
+            if top_level >= current_level || chapter.is_meta {
                 ncx_navpoints.push_str("</navPoint>\n");
-                open_volume = false;
+                nav_stack_levels.pop();
+            } else {
+                break;
             }
-            ncx_navpoints.push_str(&format!(
-                r#"<navPoint id="navPoint-{}" playOrder="{}"><navLabel><text>{}</text></navLabel><content src="{}"/></navPoint>"#,
-                play_order, play_order, safe_display_title, href_in_opf
-            ));
-            ncx_navpoints.push('\n');
+        }
+
+        ncx_navpoints.push_str(&format!(
+            r#"<navPoint id="navPoint-{}" playOrder="{}"><navLabel><text>{}</text></navLabel><content src="{}"/>"#,
+            play_order, play_order, safe_display_title, href_in_opf
+        ));
+        ncx_navpoints.push('\n');
+
+        if !chapter.is_meta {
+            nav_stack_levels.push(current_level);
+        } else {
+            ncx_navpoints.push_str("</navPoint>\n");
         }
         play_order += 1;
     }
 
-    if open_volume {
+    while nav_stack_levels.pop().is_some() {
         ncx_navpoints.push_str("</navPoint>\n");
     }
 
@@ -1431,7 +1479,7 @@ async fn extract_epub(epub_path: String) -> Result<Vec<EpubFileNode>, String> {
         let mut sorted_dirs: Vec<_> = root_map.into_iter().collect();
         sorted_dirs.sort_by(|a, b| a.0.cmp(&b.0));
 
-        for (dir_name, mut files) in sorted_dirs {
+        for (dir_name, files) in sorted_dirs {
             // 按路径深度分组子文件夹
             let mut subdir_map: HashMap<String, Vec<EpubFileNode>> = HashMap::new();
             let mut dir_files = Vec::new();
